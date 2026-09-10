@@ -2,33 +2,13 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run live (needs API key in .env)",
+            "name": "Run API (uvicorn)",
             "type": "debugpy",
             "request": "launch",
-            "module": "src.cli",
-            "args": ["--query", "What caused the 2008 financial crisis?", "--verbose"],
+            "module": "uvicorn",
+            "args": ["app.main:app", "--reload", "--port", "8000"],
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}/.env",
-            "console": "integratedTerminal",
-            "justMyCode": true
-        },
-        {
-            "name": "Run mock demo (no API key)",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "src.cli",
-            "args": ["--mock", "--verbose"],
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": true
-        },
-        {
-            "name": "Run tests",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "pytest",
-            "args": ["tests/", "-v"],
-            "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": true
         }
