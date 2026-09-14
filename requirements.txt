@@ -4,6 +4,8 @@ groq>=0.13,<0.14
 ddgs>=9.0,<10.0
 pydantic>=2.0,<3.0
 python-dotenv>=1.0,<2.0
+langgraph>=0.2,<0.3
+langchain-core>=0.3,<0.4
 
 # dev
 debugpy>=1.8,<2.0

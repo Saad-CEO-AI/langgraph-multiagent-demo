@@ -1,117 +1,90 @@
 from __future__ import annotations
 
-import json
-import os
 from functools import lru_cache
 from typing import Iterator
 
-from groq import Groq
+from langgraph.graph.state import CompiledStateGraph
 
-from app.prompts import (
-    CRITIC_SYSTEM_PROMPT,
-    CRITIC_USER_PROMPT,
-    RESEARCHER_SYSTEM_PROMPT,
-    RESEARCHER_USER_PROMPT,
-    SUPERVISOR_SYSTEM_PROMPT,
-    SUPERVISOR_USER_PROMPT,
-)
-from app.schemas import CritiqueVerdict
-from app.tools import WEB_SEARCH_TOOL_SCHEMA, web_search
-
-MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
-MAX_REVISIONS = 2
-MAX_TOOL_ROUNDS = 3
+from app.exceptions import AgentError, GuardrailBlockedError, UpstreamProviderError
+from app.graph import build_graph
+from app.llm_client import MODEL, get_client
+from app.prompts import SUPERVISOR_SYSTEM_PROMPT, SUPERVISOR_USER_PROMPT
+from app.schemas import AgentEvent
+from app.state import GraphState
 
 
 @lru_cache(maxsize=1)
-def _client() -> Groq:
-    return Groq(api_key=os.environ["GROQ_API_KEY"], max_retries=3)
+def _compiled_graph() -> CompiledStateGraph:
+    return build_graph()
 
 
-def _run_researcher(query: str, critique: str) -> str:
-    """Researcher agent: drafts an answer, searching the web when it needs to."""
-    messages = [
-        {"role": "system", "content": RESEARCHER_SYSTEM_PROMPT},
-        {"role": "user", "content": RESEARCHER_USER_PROMPT.format(query=query, critique=critique or "(none)")},
-    ]
-
-    for _ in range(MAX_TOOL_ROUNDS):
-        message = _client().chat.completions.create(
-            model=MODEL, messages=messages, tools=[WEB_SEARCH_TOOL_SCHEMA], temperature=0.0
-        ).choices[0].message
-
-        if not message.tool_calls:
-            return message.content or ""
-
-        messages.append(
-            {"role": "assistant", "content": message.content, "tool_calls": [tc.model_dump() for tc in message.tool_calls]}
-        )
-        for call in message.tool_calls:
-            args = json.loads(call.function.arguments)
-            result = web_search(args.get("query", query))
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-
-    return _forced_text_answer(query, critique)
+def _initial_state(query: str) -> GraphState:
+    return GraphState(
+        query=query,
+        guardrail_allowed=True,
+        guardrail_reason="",
+        draft="",
+        critique="",
+        verdict="needs_revision",
+        revision_count=0,
+    )
 
 
-def _forced_text_answer(query: str, critique: str) -> str:
-    """Tool-call budget exhausted; ask fresh, from a clean prompt, for a plain-text answer.
-
-    Continuing the tool-call-laden conversation here can still prime this
-    model into emitting another tool call even with none declared, which the
-    API rejects outright -- so this asks fresh instead of reusing that
-    history, and never returns an empty draft even if this also fails.
-    """
-    messages = [
-        {"role": "system", "content": RESEARCHER_SYSTEM_PROMPT},
-        {"role": "user", "content": RESEARCHER_USER_PROMPT.format(query=query, critique=critique or "(none)")},
-        {"role": "user", "content": "Answer now in plain text using what you already know. Do not call any tools."},
-    ]
-    try:
-        message = _client().chat.completions.create(model=MODEL, messages=messages, temperature=0.0).choices[0].message
-        return message.content or ""
-    except Exception:  # noqa: BLE001 - last-resort boundary: guarantee non-empty text, never propagate here
-        return "Unable to produce a complete answer after repeated search attempts."
+def _translate(node_name: str, node_output: dict) -> Iterator[AgentEvent]:
+    """Turns one LangGraph node's output into the client-facing event(s) for it."""
+    if node_name == "guardrail":
+        if node_output["guardrail_allowed"]:
+            yield AgentEvent(agent="guardrail", type="status", content="Query allowed.")
+        else:
+            yield AgentEvent(
+                agent="guardrail", type="status", content=f"Query blocked: {node_output['guardrail_reason']}"
+            )
+    elif node_name == "researcher":
+        yield AgentEvent(agent="researcher", type="draft", content=node_output["draft"])
+    elif node_name == "critic":
+        if node_output["verdict"] == "approved":
+            yield AgentEvent(agent="critic", type="verdict", content="Approved.")
+        else:
+            yield AgentEvent(agent="critic", type="verdict", content=f"Needs revision: {node_output['critique']}")
 
 
-def _run_critic(query: str, draft: str) -> CritiqueVerdict:
-    """Critic agent: grades the draft and returns a typed verdict, not free text."""
-    messages = [
-        {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
-        {"role": "user", "content": CRITIC_USER_PROMPT.format(query=query, draft=draft)},
-    ]
-    content = _client().chat.completions.create(
-        model=MODEL, messages=messages, temperature=0.0, response_format={"type": "json_object"}
-    ).choices[0].message.content
-
-    try:
-        return CritiqueVerdict.model_validate(json.loads(content))
-    except (json.JSONDecodeError, ValueError):
-        return CritiqueVerdict(verdict="needs_revision", critique="Critic returned a malformed verdict; revise and retry.")
-
-
-def _stream_final_answer(query: str, draft: str) -> Iterator[str]:
+def _stream_final_answer(query: str, draft: str) -> Iterator[AgentEvent]:
     """Supervisor's own call: synthesises the approved draft into the streamed reply."""
     messages = [
         {"role": "system", "content": SUPERVISOR_SYSTEM_PROMPT},
         {"role": "user", "content": SUPERVISOR_USER_PROMPT.format(query=query, draft=draft)},
     ]
-    stream = _client().chat.completions.create(model=MODEL, messages=messages, temperature=0.0, stream=True)
+    stream = get_client().chat.completions.create(model=MODEL, messages=messages, temperature=0.0, stream=True)
     for chunk in stream:
         delta = chunk.choices[0].delta.content
         if delta:
-            yield delta
+            yield AgentEvent(agent="supervisor", type="token", content=delta)
+    yield AgentEvent(agent="supervisor", type="final", content="")
 
 
-def run_supervisor(query: str) -> Iterator[str]:
-    """Orchestrates Researcher and Critic, then streams the Supervisor's final synthesis."""
-    draft, critique = "", ""
+def run_supervisor(query: str) -> Iterator[AgentEvent]:
+    """Runs the Guardrail/Researcher/Critic graph, then streams the Supervisor's synthesis.
 
-    for revision_count in range(1, MAX_REVISIONS + 1):
-        draft = _run_researcher(query, critique)
-        verdict = _run_critic(query, draft)
-        if verdict.verdict == "approved" or revision_count == MAX_REVISIONS:
-            break
-        critique = verdict.critique
+    Every failure mode ends the stream with one clean AgentEvent rather than
+    a truncated response: a blocked query yields a refusal, and any upstream
+    failure yields a typed error -- neither ever raises past this function.
+    """
+    accumulated = _initial_state(query)
 
-    yield from _stream_final_answer(query, draft)
+    try:
+        for step in _compiled_graph().stream(accumulated, stream_mode="updates"):
+            for node_name, node_output in step.items():
+                accumulated.update(node_output)
+                yield from _translate(node_name, node_output)
+
+        if not accumulated["guardrail_allowed"]:
+            raise GuardrailBlockedError(accumulated["guardrail_reason"] or "This request cannot be fulfilled.")
+
+        yield from _stream_final_answer(query, accumulated["draft"])
+
+    except GuardrailBlockedError as exc:
+        yield AgentEvent(agent="supervisor", type="refusal", content=exc.reason)
+    except AgentError as exc:
+        yield AgentEvent(agent="supervisor", type="error", content=str(exc))
+    except Exception as exc:  # noqa: BLE001 - stream boundary: any unexpected failure becomes one clean event, never a truncated response
+        yield AgentEvent(agent="supervisor", type="error", content=str(UpstreamProviderError(str(exc))))
