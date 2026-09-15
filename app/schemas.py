@@ -14,6 +14,11 @@ class GuardrailVerdict(BaseModel):
     reason: str = Field(description="Why the query was blocked. Empty string if allowed.")
 
 
+class SupervisorRoutingDecision(BaseModel):
+    next: Literal["researcher", "critic", "finish"] = Field(description="Which agent should act next.")
+    reason: str = Field(description="One short sentence explaining the choice.")
+
+
 class CritiqueVerdict(BaseModel):
     verdict: Literal["approved", "needs_revision"] = Field(
         description="approved if the draft fully and accurately answers the "

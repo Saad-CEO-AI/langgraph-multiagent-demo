@@ -8,7 +8,7 @@ from langgraph.graph.state import CompiledStateGraph
 from app.exceptions import AgentError, GuardrailBlockedError, UpstreamProviderError
 from app.graph import build_graph
 from app.llm_client import MODEL, get_client
-from app.prompts import SUPERVISOR_SYSTEM_PROMPT, SUPERVISOR_USER_PROMPT
+from app.prompts import SUPERVISOR_SYNTHESIS_SYSTEM_PROMPT, SUPERVISOR_SYNTHESIS_USER_PROMPT
 from app.schemas import AgentEvent
 from app.state import GraphState
 
@@ -24,9 +24,12 @@ def _initial_state(query: str) -> GraphState:
         guardrail_allowed=True,
         guardrail_reason="",
         draft="",
+        reviewed=False,
         critique="",
         verdict="needs_revision",
         revision_count=0,
+        next_agent="",
+        supervisor_reason="",
     )
 
 
@@ -39,6 +42,12 @@ def _translate(node_name: str, node_output: dict) -> Iterator[AgentEvent]:
             yield AgentEvent(
                 agent="guardrail", type="status", content=f"Query blocked: {node_output['guardrail_reason']}"
             )
+    elif node_name == "supervisor":
+        yield AgentEvent(
+            agent="supervisor",
+            type="status",
+            content=f"Routing to {node_output['next_agent']}: {node_output['supervisor_reason']}",
+        )
     elif node_name == "researcher":
         yield AgentEvent(agent="researcher", type="draft", content=node_output["draft"])
     elif node_name == "critic":
@@ -49,10 +58,11 @@ def _translate(node_name: str, node_output: dict) -> Iterator[AgentEvent]:
 
 
 def _stream_final_answer(query: str, draft: str) -> Iterator[AgentEvent]:
-    """Supervisor's own call: synthesises the approved draft into the streamed reply."""
+    """The Supervisor's own call, made once it has routed to "finish": synthesises the
+    approved draft into the streamed reply."""
     messages = [
-        {"role": "system", "content": SUPERVISOR_SYSTEM_PROMPT},
-        {"role": "user", "content": SUPERVISOR_USER_PROMPT.format(query=query, draft=draft)},
+        {"role": "system", "content": SUPERVISOR_SYNTHESIS_SYSTEM_PROMPT},
+        {"role": "user", "content": SUPERVISOR_SYNTHESIS_USER_PROMPT.format(query=query, draft=draft)},
     ]
     stream = get_client().chat.completions.create(model=MODEL, messages=messages, temperature=0.0, stream=True)
     for chunk in stream:
@@ -62,8 +72,9 @@ def _stream_final_answer(query: str, draft: str) -> Iterator[AgentEvent]:
     yield AgentEvent(agent="supervisor", type="final", content="")
 
 
-def run_supervisor(query: str) -> Iterator[AgentEvent]:
-    """Runs the Guardrail/Researcher/Critic graph, then streams the Supervisor's synthesis.
+def stream_chat_response(query: str) -> Iterator[AgentEvent]:
+    """Runs the graph -- Guardrail, then the Supervisor-routed Researcher/Critic loop --
+    then streams the Supervisor's final synthesis.
 
     Every failure mode ends the stream with one clean AgentEvent rather than
     a truncated response: a blocked query yields a refusal, and any upstream

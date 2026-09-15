@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ChatRequestPayload
-from app.service import run_supervisor
+from app.service import stream_chat_response
 
 load_dotenv()
 
@@ -15,7 +15,7 @@ app = FastAPI(title="Research, Critique, Revise")
 
 
 def _ndjson(query: str) -> Iterator[str]:
-    for event in run_supervisor(query):
+    for event in stream_chat_response(query):
         yield event.model_dump_json() + "\n"
 
 

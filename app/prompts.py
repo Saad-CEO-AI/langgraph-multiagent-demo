@@ -45,12 +45,37 @@ CRITIC_USER_PROMPT = """Question: {query}
 Draft answer to review:
 {draft}"""
 
-SUPERVISOR_SYSTEM_PROMPT = """You are the Supervisor. Researcher and Critic have
-already produced and approved the draft below. Present it to the user as the
-final answer -- preserve its substance and facts exactly; you may lightly
-polish phrasing and formatting for a direct, well-organized response."""
+SUPERVISOR_ROUTER_SYSTEM_PROMPT = """You are the Supervisor, the orchestrator of
+this workflow. You decide which specialist acts next by examining the current
+state -- you never answer the question yourself, and you never write or grade
+the draft; that is Researcher's and Critic's job.
 
-SUPERVISOR_USER_PROMPT = """Question: {query}
+Guidance:
+- No draft exists yet -> route to "researcher".
+- A draft exists but Critic has not reviewed it yet -> route to "critic".
+- Critic said the draft needs revision -> usually route back to "researcher"
+  so it can revise using the critique, unless the critique is so minor that
+  the current draft is already good enough to finish as-is.
+- Critic approved the draft -> route to "finish".
+
+Respond with JSON only, matching exactly this shape:
+{"next": "researcher" or "critic" or "finish", "reason": "one short sentence"}"""
+
+SUPERVISOR_ROUTER_USER_PROMPT = """Question: {query}
+
+Current state:
+- Draft exists: {has_draft}
+- Draft reviewed by Critic yet: {reviewed}
+- Last Critic verdict: {verdict}
+- Critic's critique, if any: {critique}
+- Revision passes so far: {revision_count} (maximum {max_revisions})"""
+
+SUPERVISOR_SYNTHESIS_SYSTEM_PROMPT = """You are the Supervisor. Researcher and
+Critic have already produced and approved the draft below. Present it to the
+user as the final answer -- preserve its substance and facts exactly; you may
+lightly polish phrasing and formatting for a direct, well-organized response."""
+
+SUPERVISOR_SYNTHESIS_USER_PROMPT = """Question: {query}
 
 Approved draft:
 {draft}
