@@ -1,24 +1,24 @@
 # Research, Critique, Revise
 
 A FastAPI service running a four-agent LangGraph, structured as a hub and
-spoke: a **Supervisor** sits at the center and decides -- with a real LLM
-call, every time -- which specialist acts next. Researcher and Critic never
-hand off to each other directly; they always return to the Supervisor, which
-routes again. Every agent calls [Groq](https://console.groq.com)'s SDK
-directly -- LangGraph provides the graph, not the model calls; no LangChain
-LLM wrapper anywhere.
+spoke: a **Supervisor** is the first agent every query reaches, and it
+decides -- with a real LLM call, every time -- which specialist acts next.
+Researcher and Critic never hand off to each other directly; they always
+return to the Supervisor, which routes again. Every agent calls
+[Groq](https://console.groq.com)'s SDK directly -- LangGraph provides the
+graph, not the model calls; no LangChain LLM wrapper anywhere.
 
 ## How it works
 
-- **Guardrail** checks the query against policy before anything else runs.
-  This one step is *not* Supervisor-routed -- a guardrail the router could
-  decide to skip isn't a guardrail. A blocked query ends the graph
-  immediately.
-- **Supervisor** receives control after Guardrail passes, and after every
-  subsequent agent finishes. Each visit, it makes a real routing decision
-  (Researcher / Critic / finish) based on the current state, with its own
-  stated reason -- streamed to the client live, so its reasoning is visible,
-  not just its output.
+- **Supervisor** is the entry point and the hub. Its first job is triage:
+  reading the query itself and judging whether it looks like it might be out
+  of bounds. Most queries are ordinary and go straight to Researcher.
+- **Guardrail** is a secondary, deeper check -- only reached when the
+  Supervisor's own triage flags a query as worth it, carrying the
+  Supervisor's specific reason for the flag. It is not run on every query,
+  and it is only reachable as the Supervisor's very first decision: once a
+  draft exists, Guardrail is no longer in the option set, so it can't be
+  invoked mid-flow. A block ends the run with a refusal.
 - **Researcher** drafts an answer, calling a web-search tool when the
   question needs current or specific facts, then returns to the Supervisor.
 - **Critic** grades the draft and returns a typed verdict (`approved` /
@@ -29,24 +29,24 @@ LLM wrapper anywhere.
 - Once the Supervisor routes to "finish," it synthesises the final answer
   itself and streams it token by token.
 
-Every step -- Guardrail's decision, each Supervisor routing choice, each
-draft, the Critic's verdict, and every token of the final answer -- is
-streamed to the client as it happens, not held back until the whole thing
-finishes.
+Every step -- the Supervisor's triage, Guardrail's decision when it runs,
+each subsequent routing choice, each draft, the Critic's verdict, and every
+token of the final answer -- is streamed to the client as it happens, not
+held back until the whole thing finishes.
 
 ```mermaid
 graph TD;
 	__start__([start]):::first
-	guardrail(guardrail)
 	supervisor(supervisor)
+	guardrail(guardrail)
 	researcher(researcher)
 	critic(critic)
 	__end__([end]):::last
-	__start__ --> guardrail;
+	__start__ --> supervisor;
 	critic --> supervisor;
+	guardrail --> supervisor;
 	researcher --> supervisor;
-	guardrail -. allowed .-> supervisor;
-	guardrail -. blocked .-> __end__;
+	supervisor -.-> guardrail;
 	supervisor -.-> researcher;
 	supervisor -.-> critic;
 	supervisor -. finish .-> __end__;
@@ -57,19 +57,29 @@ That diagram is generated straight from the compiled graph
 
 ## The Supervisor's decision, not a fixed edge
 
-Earlier versions of this service ran a fixed pipeline
-(Guardrail &rarr; Researcher &rarr; Critic) and only handed the *approved
-draft* to the Supervisor at the very end, for formatting. That meant the
-Supervisor never actually decided anything -- the routing was baked into
-plain conditional-edge functions.
+Earlier versions of this service ran Guardrail unconditionally first, as a
+fixed precondition, and only handed the *approved draft* to the Supervisor at
+the very end, for formatting -- the Supervisor never actually decided
+anything. Per review, that's now inverted: the Supervisor is the first agent
+to see the query and decides for itself, case by case, whether Guardrail's
+deeper check is even warranted.
 
-Now the Supervisor is a real graph node, visited after Guardrail and after
-every subsequent agent, and it makes a genuine LLM call each time -- given
-the current state (is there a draft? has Critic reviewed it? what did Critic
-say?), it decides what happens next. That decision is then validated against
-the actual state before being trusted: the Supervisor's LLM can't skip
-Critic, and can't keep looping past the revision cap, regardless of what it
-proposes. The LLM decides; the state has the final say.
+That triage judgment -- like every other routing choice -- is validated
+against the actual state before being trusted. Two backstops exist
+specifically because they were caught by testing, not assumed safe:
+
+1. **The revision loop can't run forever.** The cap is enforced in code
+   (`_validated_next`), regardless of what the Supervisor's LLM proposes.
+2. **An unreadable routing decision escalates, it doesn't skip scrutiny.**
+   Early on, a parse failure on the routing response defaulted to
+   `"researcher"` -- for one malicious test query, that meant a failed parse
+   silently bypassed Guardrail entirely, saved only by the Researcher model's
+   own independent refusal. The fallback now defaults to `"guardrail"`
+   instead: safe everywhere (it's only honored before a draft exists; every
+   other stage computes its own correct next step regardless), and
+   specifically protective exactly where the failure occurred.
+
+The LLM decides; the state has the final say.
 
 ## Project layout
 
@@ -113,8 +123,7 @@ The response is newline-delimited JSON (`application/x-ndjson`) -- each line
 is one validated `AgentEvent`:
 
 ```json
-{"agent":"guardrail","type":"status","content":"Query allowed."}
-{"agent":"supervisor","type":"status","content":"Routing to researcher: No draft exists yet"}
+{"agent":"supervisor","type":"status","content":"Routing to researcher: ordinary factual question"}
 {"agent":"researcher","type":"draft","content":"..."}
 {"agent":"supervisor","type":"status","content":"Routing to critic: Draft exists but has not yet been reviewed"}
 {"agent":"critic","type":"verdict","content":"Approved."}
@@ -122,6 +131,16 @@ is one validated `AgentEvent`:
 {"agent":"supervisor","type":"token","content":"The"}
 {"agent":"supervisor","type":"token","content":" 2008"}
 {"agent":"supervisor","type":"final","content":""}
+```
+
+An ordinary question like this never touches Guardrail. One that the
+Supervisor's own triage flags looks like this instead:
+
+```json
+{"agent":"supervisor","type":"status","content":"Routing to guardrail: User requests instructions for violent wrongdoing"}
+{"agent":"guardrail","type":"status","content":"Query blocked: Disallowed content: instructions for violent wrongdoing"}
+{"agent":"supervisor","type":"status","content":"Routing to finish: Disallowed content: instructions for violent wrongdoing"}
+{"agent":"supervisor","type":"refusal","content":"Disallowed content: instructions for violent wrongdoing"}
 ```
 
 A blocked query short-circuits to a `refusal` event; an unrecoverable

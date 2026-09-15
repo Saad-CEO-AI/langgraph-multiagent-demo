@@ -15,7 +15,7 @@ class GuardrailVerdict(BaseModel):
 
 
 class SupervisorRoutingDecision(BaseModel):
-    next: Literal["researcher", "critic", "finish"] = Field(description="Which agent should act next.")
+    next: Literal["guardrail", "researcher", "critic", "finish"] = Field(description="Which agent should act next.")
     reason: str = Field(description="One short sentence explaining the choice.")
 
 

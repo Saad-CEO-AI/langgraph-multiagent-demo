@@ -21,6 +21,7 @@ def _compiled_graph() -> CompiledStateGraph:
 def _initial_state(query: str) -> GraphState:
     return GraphState(
         query=query,
+        guardrail_checked=False,
         guardrail_allowed=True,
         guardrail_reason="",
         draft="",

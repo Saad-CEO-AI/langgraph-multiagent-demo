@@ -26,15 +26,21 @@ MAX_TOOL_ROUNDS = 3
 
 
 def guardrail_node(state: GraphState) -> dict:
-    """Guardrail agent: a precondition on every path, checked before any other agent runs.
+    """Guardrail agent: a secondary, deeper check -- only reached when the Supervisor's
+    own triage flags a query as worth it, never run on every query.
 
-    Not routable by the Supervisor -- a guardrail the router could decide to
-    skip isn't a guardrail. It runs once, deterministically, before the
-    Supervisor ever sees the query.
+    Only reachable as the Supervisor's very first decision (see
+    _validated_next): once any draft exists, Guardrail is no longer in the
+    Supervisor's option set, so it cannot be invoked mid-flow.
     """
     messages = [
         {"role": "system", "content": GUARDRAIL_SYSTEM_PROMPT},
-        {"role": "user", "content": GUARDRAIL_USER_PROMPT.format(query=state["query"])},
+        {
+            "role": "user",
+            "content": GUARDRAIL_USER_PROMPT.format(
+                query=state["query"], flag_reason=state.get("supervisor_reason") or "(no specific reason given)"
+            ),
+        },
     ]
     content = (
         get_client()
@@ -49,23 +55,21 @@ def guardrail_node(state: GraphState) -> dict:
         # A guardrail that fails open on a parse error stops being a guardrail.
         verdict = GuardrailVerdict(allowed=False, reason="Guardrail response could not be parsed; failing closed.")
 
-    return {"guardrail_allowed": verdict.allowed, "guardrail_reason": verdict.reason}
-
-
-def route_after_guardrail(state: GraphState) -> Literal["allowed", "blocked"]:
-    return "allowed" if state["guardrail_allowed"] else "blocked"
+    return {"guardrail_checked": True, "guardrail_allowed": verdict.allowed, "guardrail_reason": verdict.reason}
 
 
 def supervisor_node(state: GraphState) -> dict:
-    """Supervisor: the graph's hub. Every path passes back through here, and it decides
-    what happens next -- not a fixed edge function reading a single field.
+    """Supervisor: the first agent to see every query, and the graph's hub -- every
+    other agent returns here, and it decides what happens next each time.
 
     Genuinely consulted on every visit (a real LLM call, not a relabelled
-    if/else), but its answer is validated against the actual state before
-    being trusted: a routing decision that skips Critic, or loops past the
-    revision cap, is a worse failure than one that's occasionally
-    over-cautious. The LLM decides; the state has the final say.
+    if/else), including its own triage judgment on whether a query needs
+    Guardrail at all. That judgment, like every other routing choice, is
+    validated against the actual state before being trusted: the LLM decides,
+    the state has the final say.
     """
+    guardrail_checked = state.get("guardrail_checked", False)
+    guardrail_allowed = state.get("guardrail_allowed", True)
     has_draft = bool(state.get("draft"))
     reviewed = state.get("reviewed", False)
     verdict = state.get("verdict", "")
@@ -78,6 +82,8 @@ def supervisor_node(state: GraphState) -> dict:
             "role": "user",
             "content": SUPERVISOR_ROUTER_USER_PROMPT.format(
                 query=state["query"],
+                guardrail_checked=guardrail_checked,
+                guardrail_verdict=("allowed" if guardrail_allowed else "blocked") if guardrail_checked else "(not checked)",
                 has_draft=has_draft,
                 reviewed=reviewed,
                 verdict=verdict if reviewed else "(not yet reviewed)",
@@ -98,14 +104,32 @@ def supervisor_node(state: GraphState) -> dict:
         decision = SupervisorRoutingDecision.model_validate(json.loads(content))
         proposed, reason = decision.next, decision.reason
     except (json.JSONDecodeError, ValueError):
-        proposed, reason = "researcher", "Routing response could not be parsed; defaulting to research."
+        # An unreadable routing decision is the one moment we can't trust our own
+        # judgment about whether this query is safe -- fail toward more scrutiny,
+        # not less. Harmless once a draft exists: _validated_next only honors
+        # "guardrail" before any draft exists, and computes the correct step
+        # regardless everywhere else.
+        proposed, reason = "guardrail", "Routing response could not be parsed; escalating to Guardrail to be safe."
 
-    next_agent = _validated_next(has_draft, reviewed, verdict, revision_count, proposed)
+    next_agent = _validated_next(guardrail_checked, guardrail_allowed, has_draft, reviewed, verdict, revision_count, proposed)
     return {"next_agent": next_agent, "supervisor_reason": reason}
 
 
-def _validated_next(has_draft: bool, reviewed: bool, verdict: str, revision_count: int, proposed: str) -> str:
+def _validated_next(
+    guardrail_checked: bool,
+    guardrail_allowed: bool,
+    has_draft: bool,
+    reviewed: bool,
+    verdict: str,
+    revision_count: int,
+    proposed: str,
+) -> str:
     """The deterministic backstop on the Supervisor's LLM decision, in priority order."""
+    if guardrail_checked and not guardrail_allowed:
+        return "finish"  # blocked; nothing left to do but let the caller turn this into a refusal
+    if not has_draft and not guardrail_checked:
+        # The one genuinely open call: does this query need a deeper Guardrail read first?
+        return proposed if proposed in ("guardrail", "researcher") else "researcher"
     if not has_draft:
         return "researcher"
     if not reviewed:
@@ -117,7 +141,7 @@ def _validated_next(has_draft: bool, reviewed: bool, verdict: str, revision_coun
     return "finish"
 
 
-def route_from_supervisor(state: GraphState) -> Literal["researcher", "critic", "finish"]:
+def route_from_supervisor(state: GraphState) -> Literal["guardrail", "researcher", "critic", "finish"]:
     return state["next_agent"]
 
 
@@ -207,16 +231,18 @@ def _run_critic(query: str, draft: str) -> CritiqueVerdict:
 def build_graph() -> CompiledStateGraph:
     builder = StateGraph(GraphState)
 
-    builder.add_node("guardrail", guardrail_node)
     builder.add_node("supervisor", supervisor_node)
+    builder.add_node("guardrail", guardrail_node)
     builder.add_node("researcher", researcher_node)
     builder.add_node("critic", critic_node)
 
-    builder.add_edge(START, "guardrail")
-    builder.add_conditional_edges("guardrail", route_after_guardrail, {"allowed": "supervisor", "blocked": END})
+    builder.add_edge(START, "supervisor")
     builder.add_conditional_edges(
-        "supervisor", route_from_supervisor, {"researcher": "researcher", "critic": "critic", "finish": END}
+        "supervisor",
+        route_from_supervisor,
+        {"guardrail": "guardrail", "researcher": "researcher", "critic": "critic", "finish": END},
     )
+    builder.add_edge("guardrail", "supervisor")
     builder.add_edge("researcher", "supervisor")
     builder.add_edge("critic", "supervisor")
 
