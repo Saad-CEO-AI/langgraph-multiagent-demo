@@ -11,7 +11,7 @@ class GraphState(TypedDict):
     draft: str
     reviewed: bool
     critique: str
-    verdict: Literal["approved", "needs_revision"]
+    verdict: Literal["approved", "needs_revision", ""]
     revision_count: int
     next_agent: Literal["guardrail", "researcher", "critic", "finish", ""]
     supervisor_reason: str

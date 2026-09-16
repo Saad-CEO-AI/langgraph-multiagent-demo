@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from typing import Literal
 
+import structlog
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.llm_client import MODEL, get_client
+from app.logging_config import timed
 from app.prompts import (
     CRITIC_SYSTEM_PROMPT,
     CRITIC_USER_PROMPT,
@@ -24,6 +26,8 @@ from app.tools import WEB_SEARCH_TOOL_SCHEMA, web_search
 MAX_REVISIONS = 2
 MAX_TOOL_ROUNDS = 3
 
+logger = structlog.get_logger(__name__)
+
 
 def guardrail_node(state: GraphState) -> dict:
     """Guardrail agent: a secondary, deeper check -- only reached when the Supervisor's
@@ -33,6 +37,7 @@ def guardrail_node(state: GraphState) -> dict:
     _validated_next): once any draft exists, Guardrail is no longer in the
     Supervisor's option set, so it cannot be invoked mid-flow.
     """
+    logger.info("node_started", node="guardrail")
     messages = [
         {"role": "system", "content": GUARDRAIL_SYSTEM_PROMPT},
         {
@@ -42,12 +47,15 @@ def guardrail_node(state: GraphState) -> dict:
             ),
         },
     ]
-    content = (
-        get_client()
-        .chat.completions.create(model=MODEL, messages=messages, temperature=0.0, response_format={"type": "json_object"})
-        .choices[0]
-        .message.content
-    )
+    with timed(logger, "llm_call", node="guardrail"):
+        content = (
+            get_client()
+            .chat.completions.create(
+                model=MODEL, messages=messages, temperature=0.0, response_format={"type": "json_object"}
+            )
+            .choices[0]
+            .message.content
+        )
 
     try:
         verdict = GuardrailVerdict.model_validate(json.loads(content))
@@ -55,6 +63,7 @@ def guardrail_node(state: GraphState) -> dict:
         # A guardrail that fails open on a parse error stops being a guardrail.
         verdict = GuardrailVerdict(allowed=False, reason="Guardrail response could not be parsed; failing closed.")
 
+    logger.info("node_finished", node="guardrail", allowed=verdict.allowed)
     return {"guardrail_checked": True, "guardrail_allowed": verdict.allowed, "guardrail_reason": verdict.reason}
 
 
@@ -68,6 +77,7 @@ def supervisor_node(state: GraphState) -> dict:
     validated against the actual state before being trusted: the LLM decides,
     the state has the final say.
     """
+    logger.info("node_started", node="supervisor")
     guardrail_checked = state.get("guardrail_checked", False)
     guardrail_allowed = state.get("guardrail_allowed", True)
     has_draft = bool(state.get("draft"))
@@ -93,12 +103,15 @@ def supervisor_node(state: GraphState) -> dict:
             ),
         },
     ]
-    content = (
-        get_client()
-        .chat.completions.create(model=MODEL, messages=messages, temperature=0.0, response_format={"type": "json_object"})
-        .choices[0]
-        .message.content
-    )
+    with timed(logger, "llm_call", node="supervisor"):
+        content = (
+            get_client()
+            .chat.completions.create(
+                model=MODEL, messages=messages, temperature=0.0, response_format={"type": "json_object"}
+            )
+            .choices[0]
+            .message.content
+        )
 
     try:
         decision = SupervisorRoutingDecision.model_validate(json.loads(content))
@@ -112,6 +125,7 @@ def supervisor_node(state: GraphState) -> dict:
         proposed, reason = "guardrail", "Routing response could not be parsed; escalating to Guardrail to be safe."
 
     next_agent = _validated_next(guardrail_checked, guardrail_allowed, has_draft, reviewed, verdict, revision_count, proposed)
+    logger.info("node_finished", node="supervisor", next_agent=next_agent)
     return {"next_agent": next_agent, "supervisor_reason": reason}
 
 
@@ -146,24 +160,36 @@ def route_from_supervisor(state: GraphState) -> Literal["guardrail", "researcher
 
 
 def researcher_node(state: GraphState) -> dict:
-    """Researcher agent: drafts an answer, searching the web when it needs to."""
-    draft = _run_researcher(state["query"], state.get("critique", ""))
+    """Researcher agent: drafts an answer, searching the web when it needs to.
+
+    Passes its own previous draft, not just the critique, on a revision pass
+    -- "paragraph 3 is wrong" means nothing without the paragraph it refers to.
+    """
+    logger.info("node_started", node="researcher")
+    draft = _run_researcher(state["query"], state.get("draft", ""), state.get("critique", ""))
+    logger.info("node_finished", node="researcher", draft_length=len(draft))
     return {"draft": draft, "reviewed": False}
 
 
-def _run_researcher(query: str, critique: str) -> str:
+def _run_researcher(query: str, previous_draft: str, critique: str) -> str:
     messages = [
         {"role": "system", "content": RESEARCHER_SYSTEM_PROMPT},
-        {"role": "user", "content": RESEARCHER_USER_PROMPT.format(query=query, critique=critique or "(none)")},
+        {
+            "role": "user",
+            "content": RESEARCHER_USER_PROMPT.format(
+                query=query, previous_draft=previous_draft or "(none)", critique=critique or "(none)"
+            ),
+        },
     ]
 
-    for _ in range(MAX_TOOL_ROUNDS):
-        message = (
-            get_client()
-            .chat.completions.create(model=MODEL, messages=messages, tools=[WEB_SEARCH_TOOL_SCHEMA], temperature=0.0)
-            .choices[0]
-            .message
-        )
+    for round_number in range(MAX_TOOL_ROUNDS):
+        with timed(logger, "llm_call", node="researcher", round=round_number):
+            message = (
+                get_client()
+                .chat.completions.create(model=MODEL, messages=messages, tools=[WEB_SEARCH_TOOL_SCHEMA], temperature=0.0)
+                .choices[0]
+                .message
+            )
 
         if not message.tool_calls:
             return message.content or ""
@@ -176,10 +202,10 @@ def _run_researcher(query: str, critique: str) -> str:
             result = web_search(args.get("query", query))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
 
-    return _forced_text_answer(query, critique)
+    return _forced_text_answer(query, previous_draft, critique)
 
 
-def _forced_text_answer(query: str, critique: str) -> str:
+def _forced_text_answer(query: str, previous_draft: str, critique: str) -> str:
     """Tool-call budget exhausted; ask fresh, from a clean prompt, for a plain-text answer.
 
     Continuing the tool-call-laden conversation here can still prime this
@@ -189,11 +215,17 @@ def _forced_text_answer(query: str, critique: str) -> str:
     """
     messages = [
         {"role": "system", "content": RESEARCHER_SYSTEM_PROMPT},
-        {"role": "user", "content": RESEARCHER_USER_PROMPT.format(query=query, critique=critique or "(none)")},
+        {
+            "role": "user",
+            "content": RESEARCHER_USER_PROMPT.format(
+                query=query, previous_draft=previous_draft or "(none)", critique=critique or "(none)"
+            ),
+        },
         {"role": "user", "content": "Answer now in plain text using what you already know. Do not call any tools."},
     ]
     try:
-        message = get_client().chat.completions.create(model=MODEL, messages=messages, temperature=0.0).choices[0].message
+        with timed(logger, "llm_call", node="researcher", round="forced_text"):
+            message = get_client().chat.completions.create(model=MODEL, messages=messages, temperature=0.0).choices[0].message
         return message.content or ""
     except Exception:  # noqa: BLE001 - last-resort boundary: guarantee non-empty text, never propagate here
         return "Unable to produce a complete answer after repeated search attempts."
@@ -201,7 +233,9 @@ def _forced_text_answer(query: str, critique: str) -> str:
 
 def critic_node(state: GraphState) -> dict:
     """Critic agent: grades the draft and returns a typed verdict, not free text."""
+    logger.info("node_started", node="critic")
     verdict = _run_critic(state["query"], state["draft"])
+    logger.info("node_finished", node="critic", verdict=verdict.verdict)
     return {
         "verdict": verdict.verdict,
         "critique": verdict.critique,
@@ -215,12 +249,15 @@ def _run_critic(query: str, draft: str) -> CritiqueVerdict:
         {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
         {"role": "user", "content": CRITIC_USER_PROMPT.format(query=query, draft=draft)},
     ]
-    content = (
-        get_client()
-        .chat.completions.create(model=MODEL, messages=messages, temperature=0.0, response_format={"type": "json_object"})
-        .choices[0]
-        .message.content
-    )
+    with timed(logger, "llm_call", node="critic"):
+        content = (
+            get_client()
+            .chat.completions.create(
+                model=MODEL, messages=messages, temperature=0.0, response_format={"type": "json_object"}
+            )
+            .choices[0]
+            .message.content
+        )
 
     try:
         return CritiqueVerdict.model_validate(json.loads(content))

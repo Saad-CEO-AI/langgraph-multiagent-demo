@@ -6,10 +6,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
+from app.logging_config import configure_logging
 from app.schemas import ChatRequestPayload
 from app.service import stream_chat_response
 
 load_dotenv()
+configure_logging()
 
 app = FastAPI(title="Research, Critique, Revise")
 

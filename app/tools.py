@@ -17,7 +17,10 @@ WEB_SEARCH_TOOL_SCHEMA = {
 
 
 def web_search(query: str, max_results: int = 5) -> str:
-    results = DDGS().text(query, max_results=max_results)
+    try:
+        results = DDGS().text(query, max_results=max_results)
+    except Exception as exc:  # noqa: BLE001 - a search outage should degrade, not crash the graph
+        return f"Web search is unavailable right now ({exc}). Answer from your own knowledge instead."
     if not results:
         return "No results found."
     return "\n\n".join(f"{r['title']}: {r['body']}" for r in results)

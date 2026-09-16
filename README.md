@@ -85,15 +85,20 @@ The LLM decides; the state has the final say.
 
 ```
 app/
-  main.py         FastAPI app, POST /chat/stream -> NDJSON stream of AgentEvent
-  service.py      Runs the graph, turns node updates into events, streams the final synthesis
-  graph.py        The LangGraph StateGraph: Guardrail/Supervisor/Researcher/Critic nodes and routing
-  state.py        GraphState (the graph's shared state)
-  schemas.py      ChatRequestPayload, AgentEvent, SupervisorRoutingDecision, CritiqueVerdict, GuardrailVerdict
-  prompts.py      Raw prompt strings, one set per agent (including the Supervisor's router and synthesiser)
-  tools.py        The Researcher's web-search tool
-  exceptions.py   AgentError, GuardrailBlockedError, UpstreamProviderError
-  llm_client.py   The single Groq client every agent calls through
+  main.py           FastAPI app, POST /chat/stream -> NDJSON stream of AgentEvent
+  service.py        Runs the graph, turns node updates into events, streams the final synthesis
+  graph.py          The LangGraph StateGraph: Guardrail/Supervisor/Researcher/Critic nodes and routing
+  state.py          GraphState (the graph's shared state)
+  schemas.py        ChatRequestPayload, AgentEvent, SupervisorRoutingDecision, CritiqueVerdict, GuardrailVerdict
+  prompts.py        Raw prompt strings, one set per agent (including the Supervisor's router and synthesiser)
+  tools.py          The Researcher's web-search tool
+  exceptions.py     AgentError, GuardrailBlockedError, UpstreamProviderError
+  llm_client.py     The single Groq client every agent calls through, with a request timeout
+  logging_config.py structlog setup and a timed() helper used around every LLM call
+tests/
+  test_validated_next.py  Unit tests: every branch of the routing backstop
+  test_integration.py      The happy path and the guardrail-blocked path, against a scripted fake client
+  fakes.py                   FakeGroqClient -- a scripted stand-in for groq.Groq, no network or API key needed
 ```
 
 ## Setup
@@ -153,6 +158,34 @@ Open the folder, then Run and Debug (`Cmd+Shift+D`) -> **"Run API
 (uvicorn)"** -> press play. The interpreter is pre-set to `.venv` in
 `.vscode/settings.json`.
 
+## Tests
+
+```bash
+pytest tests/ -v
+```
+
+No API key needed -- every test runs against `FakeGroqClient`
+(`tests/fakes.py`), a scripted stand-in that returns canned responses in a
+fixed order and raises if a test calls it more times than expected.
+`test_validated_next.py` covers every branch of the routing backstop
+directly; `test_integration.py` runs the real graph end to end for the happy
+path and the guardrail-blocked path.
+
+## Logging
+
+Every node logs `node_started` / `node_finished`, and every LLM call is
+timed and logged as `llm_call_finished` with a `duration_ms` field
+(`app/logging_config.py`, using `structlog`). A single request looks like:
+
+```json
+{"event": "request_started", "query_length": 30, ...}
+{"event": "node_started", "node": "supervisor", ...}
+{"event": "llm_call_finished", "node": "supervisor", "duration_ms": 645.2, ...}
+{"event": "node_finished", "node": "supervisor", "next_agent": "researcher", ...}
+...
+{"event": "request_finished", "outcome": "answered", ...}
+```
+
 ## Design notes
 
 - **LangGraph is the orchestration layer; Groq's SDK is the model layer.**
@@ -174,3 +207,17 @@ Open the folder, then Run and Debug (`Cmd+Shift+D`) -> **"Run API
   streaming endpoint never lets a raw exception truncate the response --
   a blocked query becomes a `refusal` event, anything else unrecoverable
   becomes a typed `error` event.
+- Every Groq call has a 30-second timeout (`llm_client.py`) -- a hung
+  request no longer blocks the worker indefinitely.
+- The Researcher receives its own previous draft on a revision pass, not
+  just the critique -- "paragraph 3 is wrong" means nothing without
+  paragraph 3 in front of the model that has to fix it.
+- `web_search` degrades instead of crashing: a network failure returns a
+  fallback string, so the Researcher can still answer from its own
+  knowledge rather than taking the whole graph down with it.
+- `service.py` never hand-merges node outputs into a shadow state variable.
+  `stream(..., stream_mode=["updates", "values"])` gives "updates" chunks
+  for translating each node's output into an event, and "values" chunks
+  carrying LangGraph's own authoritative merged state -- the final state
+  used after the loop is exactly the last "values" chunk, not a
+  reimplementation of LangGraph's own merge logic.

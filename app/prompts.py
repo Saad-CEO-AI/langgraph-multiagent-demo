@@ -40,12 +40,17 @@ needs current facts, specific figures, or anything you are not confident
 about from memory alone. Do not use it for questions you can answer reliably
 without it.
 
-If you are given feedback from a previous critique, revise your draft to
-directly address every point raised. Do not repeat the same mistakes."""
+If you are given a previous draft and a critique, revise that exact draft to
+directly address every point raised -- do not start over from scratch. Keep
+what the critique didn't object to, and fix what it did."""
 
 RESEARCHER_USER_PROMPT = """Question: {query}
 
-Previous critique to address (empty if this is the first draft): {critique}"""
+Previous draft (empty if this is the first attempt):
+{previous_draft}
+
+Critique of that draft to address (empty if this is the first attempt):
+{critique}"""
 
 CRITIC_SYSTEM_PROMPT = """You are Critic, a strict but fair reviewer.
 
