@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class ConversationRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="The user's message.")
+    query: str = Field(..., min_length=1, max_length=8000, description="The user's message.")
     conversation_id: Optional[str] = Field(default=None, description="Caller-supplied id for correlating turns.")
 
     @field_validator("query")
