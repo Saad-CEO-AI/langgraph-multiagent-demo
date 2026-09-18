@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ConversationRequest(BaseModel):
     query: str = Field(..., min_length=1, description="The user's message.")
     conversation_id: Optional[str] = Field(default=None, description="Caller-supplied id for correlating turns.")
+
+    @field_validator("query")
+    @classmethod
+    def _query_must_have_content(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("query must contain non-whitespace content")
+        return stripped
 
 
 class GuardrailVerdict(BaseModel):
@@ -53,4 +61,5 @@ class ExecutionMetadata(BaseModel):
 class ConversationResponse(BaseModel):
     answer: str
     refused: bool = False
+    conversation_id: Optional[str] = Field(default=None, description="Echoes the request's conversation_id, for correlation.")
     metadata: ExecutionMetadata

@@ -39,6 +39,7 @@ class ConversationOrchestrator:
             return ConversationResponse(
                 answer="Something went wrong while processing this request.",
                 refused=False,
+                conversation_id=request.conversation_id,
                 metadata=ExecutionMetadata(
                     guardrail_checked=False,
                     guardrail_allowed=True,
@@ -85,10 +86,16 @@ class ConversationOrchestrator:
             return ConversationResponse(
                 answer=final_state["guardrail_reason"] or "This request cannot be fulfilled.",
                 refused=True,
+                conversation_id=request.conversation_id,
                 metadata=metadata,
             )
 
-        return ConversationResponse(answer=self._synthesize(request, final_state), refused=False, metadata=metadata)
+        return ConversationResponse(
+            answer=self._synthesize(request, final_state),
+            refused=False,
+            conversation_id=request.conversation_id,
+            metadata=metadata,
+        )
 
     @staticmethod
     def _synthesize(request: ConversationRequest, final_state: GraphState) -> str:
