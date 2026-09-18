@@ -11,6 +11,17 @@
             "envFile": "${workspaceFolder}/.env",
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "Try ConversationOrchestrator (sample queries)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "orchestrator.try_it",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env",
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ]
 }
